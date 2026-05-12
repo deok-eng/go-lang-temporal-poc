@@ -1,0 +1,23 @@
+# Compiled binaries
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Go build output
+/worker.exe
+/starter.exe
+
+# Go test artifacts
+*.test
+*.out
+
+# Go module cache
+vendor/
+
+# IDE / OS
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
