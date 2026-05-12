@@ -13,16 +13,17 @@
 4. [Key Concepts Explained](#4-key-concepts-explained)
 5. [Who is the Real Orchestrator?](#5-who-is-the-real-orchestrator)
 6. [What Exactly is a Worker? EC2? Thread? Process?](#6-what-exactly-is-a-worker-ec2-thread-process)
-7. [Project Structure](#7-project-structure)
-8. [Architecture Diagram](#8-architecture-diagram)
-9. [How the Code Works — File by File](#9-how-the-code-works--file-by-file)
-10. [The Full Execution Flow](#10-the-full-execution-flow)
-11. [Prerequisites](#11-prerequisites)
-12. [Running the Project Step by Step](#12-running-the-project-step-by-step)
-13. [Monitoring with CLI](#13-monitoring-with-cli)
-14. [Monitoring with the Web UI](#14-monitoring-with-the-web-ui)
-15. [What the Logs Tell You](#15-what-the-logs-tell-you)
-16. [What Happens When Things Fail](#16-what-happens-when-things-fail)
+7. [Understanding Activities — 3 Functions, 3 Tasks](#7-understanding-activities--3-functions-3-tasks)
+8. [Project Structure](#8-project-structure)
+9. [Architecture Diagram](#9-architecture-diagram)
+10. [How the Code Works — File by File](#10-how-the-code-works--file-by-file)
+11. [The Full Execution Flow](#11-the-full-execution-flow)
+12. [Prerequisites](#12-prerequisites)
+13. [Running the Project Step by Step](#13-running-the-project-step-by-step)
+14. [Monitoring with CLI](#14-monitoring-with-cli)
+15. [Monitoring with the Web UI](#15-monitoring-with-the-web-ui)
+16. [What the Logs Tell You](#16-what-the-logs-tell-you)
+17. [What Happens When Things Fail](#17-what-happens-when-things-fail)
 
 ---
 
@@ -374,7 +375,124 @@ Each ECS Task is one worker process. Workers are stateless — you can kill and 
 
 ---
 
-## 7. Project Structure
+## 7. Understanding Activities — 3 Functions, 3 Tasks
+
+`activities.go` contains exactly 3 functions. Each function is one specific task that Temporal can schedule, execute, retry, and track independently.
+
+```go
+// Task 1 — validate the order data
+func ValidateOrder(ctx context.Context, order Order) (string, error) { ... }
+
+// Task 2 — charge the customer
+func ChargePayment(ctx context.Context, order Order) (string, error) { ... }
+
+// Task 3 — send confirmation email
+func SendConfirmation(ctx context.Context, order Order) (string, error) { ... }
+```
+
+Yes — that's all they are. Plain Go functions. No special interface, no embedding, no annotations.
+
+---
+
+### Why separate functions instead of one big function?
+
+This is the core design decision. Compare the two approaches:
+
+**Without Temporal — one big function:**
+```go
+func processOrder(order Order) error {
+    validate(order)   // step 1 — runs fine
+    charge(order)     // step 2 — crashes here
+    confirm(order)    // step 3 — never runs, no one knows
+}
+```
+If it crashes at step 2, you have no idea what ran. You restart from scratch. Step 2 might charge the card twice.
+
+**With Temporal — 3 separate activity functions:**
+```go
+// Each call is a separate checkpoint written to Temporal's history
+workflow.ExecuteActivity(ctx, ValidateOrder, order)    // ✅ completed, recorded
+workflow.ExecuteActivity(ctx, ChargePayment, order)    // 💥 worker crashes here
+workflow.ExecuteActivity(ctx, SendConfirmation, order) // ← resumes exactly here
+```
+Temporal knows exactly which ones completed. On recovery it skips the done ones and picks up from `SendConfirmation`. The card is never charged twice.
+
+---
+
+### The 3 rules for an activity function
+
+There are only 3 rules — everything else is up to you:
+
+| Rule | Why |
+|------|-----|
+| First argument must be `context.Context` | Temporal uses it for cancellation and heartbeating |
+| Last return value must be `error` | How Temporal knows if the task succeeded or failed |
+| Should be idempotent where possible | Because Temporal may retry it — same input should produce same outcome |
+
+That's it. They can do anything — DB queries, HTTP calls, file I/O, sending emails, calling external APIs.
+
+---
+
+### What these functions look like in a real application
+
+In this project they simulate work with `fmt.Printf`. In production each would be a real integration:
+
+```go
+func ValidateOrder(ctx context.Context, order Order) (string, error) {
+    // query your inventory database
+    // call a fraud detection API
+    // check customer credit limit
+    // return error if any check fails → Temporal retries automatically
+}
+
+func ChargePayment(ctx context.Context, order Order) (string, error) {
+    // call Stripe / PayPal API
+    // write transaction record to your database
+    // return error if payment fails → Temporal retries automatically
+}
+
+func SendConfirmation(ctx context.Context, order Order) (string, error) {
+    // call SendGrid / AWS SES
+    // write notification record to your database
+    // return error if email fails → Temporal retries automatically
+}
+```
+
+Each one is independently retryable. If `ChargePayment` fails because Stripe is temporarily down, Temporal retries just that function — `ValidateOrder` does not run again.
+
+---
+
+### How Temporal sees each function
+
+When you register activities on the worker:
+
+```go
+w.RegisterActivity(orderworkflow.ValidateOrder)
+w.RegisterActivity(orderworkflow.ChargePayment)
+w.RegisterActivity(orderworkflow.SendConfirmation)
+```
+
+Temporal registers each function by its name as an **activity type**. When the workflow calls `workflow.ExecuteActivity(ctx, ValidateOrder, order)`, Temporal puts a task on the queue with type `"ValidateOrder"`. The worker picks it up, looks up the registered function by that name, and calls it. The result goes back to Temporal, which wakes the workflow up with it.
+
+```
+workflow.ExecuteActivity(ctx, ValidateOrder, order)
+         │
+         ▼
+Temporal Server: schedule activity task type="ValidateOrder"
+         │
+         ▼
+Worker: look up registered function "ValidateOrder" → call it → return result
+         │
+         ▼
+Temporal Server: record ActivityTaskCompleted event
+         │
+         ▼
+Workflow: resumes with the result string
+```
+
+---
+
+## 8. Project Structure
 
 ```
 temporal-order-workflow/
@@ -400,7 +518,7 @@ temporal-order-workflow/
 
 ---
 
-## 8. Architecture Diagram
+## 9. Architecture Diagram
 
 ```
 ┌──────────────────────────────────────────────────────────────────────┐
@@ -457,7 +575,7 @@ temporal-order-workflow/
 
 ---
 
-## 9. How the Code Works — File by File
+## 10. How the Code Works — File by File
 
 ### `workflow.go` — The Orchestrator
 
@@ -608,7 +726,7 @@ The `WorkflowID` is important — it's the unique identifier for this execution.
 
 ---
 
-## 10. The Full Execution Flow
+## 11. The Full Execution Flow
 
 Here is exactly what happens when you run `go run starter/main.go`, mapped to the 23 events Temporal recorded:
 
@@ -654,7 +772,7 @@ The starter's `.Get()` call unblocks and prints the result.
 
 ---
 
-## 11. Prerequisites
+## 12. Prerequisites
 
 | Tool | Version | Purpose |
 |------|---------|---------|
@@ -675,7 +793,7 @@ Or download from https://github.com/temporalio/cli/releases
 
 ---
 
-## 12. Running the Project Step by Step
+## 13. Running the Project Step by Step
 
 You need **3 terminals** open at the same time.
 
@@ -765,7 +883,7 @@ Meanwhile, in Terminal 2 (worker), you'll see each activity executing:
 
 ---
 
-## 13. Monitoring with CLI
+## 14. Monitoring with CLI
 
 After running the workflow, use the Temporal CLI to inspect it.
 
@@ -821,7 +939,7 @@ Pollers:
 
 ---
 
-## 14. Monitoring with the Web UI
+## 15. Monitoring with the Web UI
 
 Open **http://localhost:8233** in your browser.
 
@@ -841,7 +959,7 @@ Click on any workflow execution to see:
 
 ---
 
-## 15. What the Logs Tell You
+## 16. What the Logs Tell You
 
 ### Worker log breakdown
 
@@ -869,7 +987,7 @@ This pattern repeats for `ChargePayment` and `SendConfirmation`.
 
 ---
 
-## 16. What Happens When Things Fail
+## 17. What Happens When Things Fail
 
 ### If an activity returns an error
 Temporal retries it automatically. With our retry policy:
